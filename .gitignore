@@ -1,0 +1,4 @@
+.pytest_cache/
+
+#no need since it's a library
+poetry.lock
