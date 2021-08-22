@@ -1,10 +1,15 @@
 import asyncio
 import logging
-import time
+import typing
 from typing import Mapping
 
 import aiohttp
-import humanize
+
+import mint_strategy.loan_book.session as s
+import mint_strategy.loan_book.timer as t
+
+
+log = logging.getLogger(__name__)
 
 allow_override = [
     'accept',
@@ -31,49 +36,54 @@ static_headers = {
 
 
 class Downloader:
-    def __init__(self, client_session: aiohttp.ClientSession):
+    def __init__(
+            self,
+            client_session: aiohttp.ClientSession,
+            sess_factory: s.SessionFactory
+    ):
         self.client_session = client_session
-        self.in_session = False
+        self._sess_factory = sess_factory
+        self._current_sess:s.Session = None
 
-    async def download(self, cookies: Mapping[str, str], headers: Mapping[str, str]) -> bool:
-        if self.in_session:
+    async def download(self, cookies: typing.Mapping[str, str], headers: typing.Mapping[str, str]) -> bool:
+        if self._current_sess:
             return False
 
-        self.in_session = True
+        self._current_sess = self._sess_factory()
+
+        async def defer():
+            try:
+                await self._download(cookies, headers)
+            finally:
+                self._current_sess = None
 
         try:
             loop = asyncio.get_event_loop()
-            logging.info('start download')
-            task = loop.create_task(self._download(cookies, headers))
-            logging.info('returning response')
+            task = loop.create_task(defer())
+
             return True
         except:
             return False
-        finally:
-            self.in_session = False
 
-    async def _download(self, cookies: Mapping[str, str], headers: Mapping[str, str]) -> None:
-        headers = {**static_headers, **{k: v for k, v in headers.items() if k in allow_override}}
+    async def _download(self, cookies: typing.Mapping[str, str], headers: Mapping[str, str]) -> None:
+        headers = static_headers | {k: v for k, v in headers.items() if k in allow_override}
 
-        time_start = time.perf_counter()
-        async with self.client_session.get('https://www.mintos.com/en/loan-book/download',
-                                           cookies=cookies,
-                                           headers=headers,
-                                           timeout=aiohttp.ClientTimeout(
-                                               total=60 * 60,
-                                               sock_read=aiohttp.client.DEFAULT_TIMEOUT
-                                           )
-                                           ) as response:
-            logging.info('downloading')
-            with open('loan_book.zip', 'wb') as fd:
-                while True:
-                    chunk = await response.content.read(2 ** 20)
-                    if not chunk:
-                        break
-                    fd.write(chunk)
+        with t.Timer('Download loan_book') as timer:
+            async with self.client_session.get(
+                    'https://www.mintos.com/en/loan-book/download',
+                    cookies=cookies,
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(
+                        total=60 * 60,
+                        sock_read=5 * 60
+                    )
+            ) as response:
+                log.info('downloading to %s', self._current_sess.home)
+                with open(self._current_sess.zipped, 'wb') as fd:
+                    while True:
+                        chunk = await response.content.read(2 ** 20)
+                        if not chunk:
+                            break
+                        fd.write(chunk)
                     data_len = fd.tell()
-        time_end = time.perf_counter()
-        elapsed = time_end - time_start;
-        speed_bps = data_len / elapsed
-        speed = humanize.naturalsize(speed_bps)
-        logging.info('download done %s/s', speed)
+            timer.bytes_processed = data_len
